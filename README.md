@@ -3,7 +3,7 @@
 This is an out-of-tree mirror of rustdoc. The purpose of this is to have
 a cargo-buildable version of rustdoc that is easier to develop on than the
 one that comes with rustc.
-Please not that this is not a fork of rustdoc, so please send all pull requests
+Please note that this is not a fork of rustdoc, so please send all pull requests
 to [the official repository](https://github.com/rust-lang/rust).
 
 ## Building
@@ -12,7 +12,7 @@ You will need the nightly version of rust, which you can get
 [here](https://www.rust-lang.org/downloads.html).
 
 ```
-git clone git@github.com:fhartwig/rustdoc.git
+git clone git@github.com:fhartwig/standalone-rustdoc.git
 cd rustdoc
 cargo build --release
 ```
