@@ -6,6 +6,8 @@ one that comes with rustc.
 Please note that this is not a fork of rustdoc, so please send all pull requests
 to [the official repository](https://github.com/rust-lang/rust).
 
+[![Build Status](https://travis-ci.org/fhartwig/standalone-rustdoc.svg?branch=master)](https://travis-ci.org/fhartwig/standalone-rustdoc)
+
 ## Building
 
 You will need the nightly version of rust, which you can get
