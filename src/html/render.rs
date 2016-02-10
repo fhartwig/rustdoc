@@ -54,10 +54,12 @@ use externalfiles::ExternalHtml;
 
 use serialize::json::{self, ToJson};
 use syntax::{abi, ast};
+use syntax::feature_gate::UnstableFeatures;
 use rustc::middle::cstore::LOCAL_CRATE;
 use rustc::middle::def_id::{CRATE_DEF_INDEX, DefId};
 use rustc::middle::privacy::AccessLevels;
 use rustc::middle::stability;
+use rustc::session::config::get_unstable_features_setting;
 use rustc_front::hir;
 
 use clean::{self, SelfTy};
@@ -819,7 +821,7 @@ fn clean_srcpath<F>(src_root: &Path, p: &Path, keep_filename: bool, mut f: F) wh
     F: FnMut(&str),
 {
     // make it relative, if possible
-    let p = p.relative_from(src_root).unwrap_or(p);
+    let p = p.strip_prefix(src_root).unwrap_or(p);
 
     let mut iter = p.iter().map(|x| x.to_str().unwrap()).peekable();
     while let Some(c) = iter.next() {
@@ -1058,14 +1060,16 @@ impl DocFolder for Cache {
                         }
                     });
 
-                    self.search_index.push(IndexItem {
-                        ty: shortty(&item),
-                        name: s.to_string(),
-                        path: path.join("::").to_string(),
-                        desc: shorter(item.doc_value()),
-                        parent: parent,
-                        search_type: get_index_search_type(&item, parent_basename),
-                    });
+                    if item.def_id.index != CRATE_DEF_INDEX {
+                        self.search_index.push(IndexItem {
+                            ty: shortty(&item),
+                            name: s.to_string(),
+                            path: path.join("::").to_string(),
+                            desc: shorter(item.doc_value()),
+                            parent: parent,
+                            search_type: get_index_search_type(&item, parent_basename),
+                        });
+                    }
                 }
                 (Some(parent), None) if is_method || (!self.privmod && !hidden_field)=> {
                     if parent.is_local() {
@@ -1817,10 +1821,10 @@ fn short_stability(item: &clean::Item, cx: &Context, show_reason: bool) -> Optio
         } else if stab.level == stability::Unstable {
             let unstable_extra = if show_reason {
                 match (!stab.feature.is_empty(), &cx.issue_tracker_base_url, stab.issue) {
-                    (true, &Some(ref tracker_url), Some(issue_no)) =>
+                    (true, &Some(ref tracker_url), Some(issue_no)) if issue_no > 0 =>
                         format!(" (<code>{}</code> <a href=\"{}{}\">#{}</a>)",
                                 Escape(&stab.feature), tracker_url, issue_no, issue_no),
-                    (false, &Some(ref tracker_url), Some(issue_no)) =>
+                    (false, &Some(ref tracker_url), Some(issue_no)) if issue_no > 0 =>
                         format!(" (<a href=\"{}{}\">#{}</a>)", Escape(&tracker_url), issue_no,
                                 issue_no),
                     (true, _, _) =>
@@ -1895,10 +1899,14 @@ fn item_static(w: &mut fmt::Formatter, cx: &Context, it: &clean::Item,
 
 fn item_function(w: &mut fmt::Formatter, cx: &Context, it: &clean::Item,
                  f: &clean::Function) -> fmt::Result {
+    let vis_constness = match get_unstable_features_setting() {
+        UnstableFeatures::Allow => f.constness,
+        _ => hir::Constness::NotConst
+    };
     try!(write!(w, "<pre class='rust fn'>{vis}{constness}{unsafety}{abi}fn \
                     {name}{generics}{decl}{where_clause}</pre>",
            vis = VisSpace(it.visibility),
-           constness = ConstnessSpace(f.constness),
+           constness = ConstnessSpace(vis_constness),
            unsafety = UnsafetySpace(f.unsafety),
            abi = AbiSpace(f.abi),
            name = it.name.as_ref().unwrap(),
@@ -2120,9 +2128,13 @@ fn render_assoc_item(w: &mut fmt::Formatter, meth: &clean::Item,
                 href(did).map(|p| format!("{}{}", p.0, anchor)).unwrap_or(anchor)
             }
         };
+        let vis_constness = match get_unstable_features_setting() {
+            UnstableFeatures::Allow => constness,
+            _ => hir::Constness::NotConst
+        };
         write!(w, "{}{}{}fn <a href='{href}' class='fnname'>{name}</a>\
                    {generics}{decl}{where_clause}",
-               ConstnessSpace(constness),
+               ConstnessSpace(vis_constness),
                UnsafetySpace(unsafety),
                match abi {
                    Abi::Rust => String::new(),

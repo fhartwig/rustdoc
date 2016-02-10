@@ -10,7 +10,8 @@
 pub use self::MaybeTyped::*;
 
 use rustc_lint;
-use rustc_driver::{driver, target_features};
+use rustc_driver::{driver, target_features, abort_on_err};
+use rustc::dep_graph::DepGraph;
 use rustc::session::{self, config};
 use rustc::middle::def_id::DefId;
 use rustc::middle::privacy::AccessLevels;
@@ -29,8 +30,6 @@ use syntax::parse::token;
 
 use std::cell::{RefCell, Cell};
 use std::collections::{HashMap, HashSet};
-use std::env::var_os;
-use std::path::PathBuf;
 use std::rc::Rc;
 
 use visit_ast::RustdocVisitor;
@@ -104,10 +103,9 @@ pub fn run_core(search_paths: SearchPaths, cfgs: Vec<String>, externs: Externs,
     };
 
     let warning_lint = lint::builtin::WARNINGS.name_lower();
-    let sysroot = var_os("RUST_SYSROOT").expect("RUST_SYSROOT env var not set");
 
     let sessopts = config::Options {
-        maybe_sysroot: Some(PathBuf::from(sysroot)),
+        maybe_sysroot: None,
         search_paths: search_paths,
         crate_types: vec!(config::CrateTypeRlib),
         lint_opts: vec!((warning_lint, lint::Allow)),
@@ -121,11 +119,11 @@ pub fn run_core(search_paths: SearchPaths, cfgs: Vec<String>, externs: Externs,
     };
 
     let codemap = Rc::new(codemap::CodeMap::new());
-    let diagnostic_handler = errors::Handler::new(ColorConfig::Auto,
-                                                  None,
-                                                  true,
-                                                  false,
-                                                  codemap.clone());
+    let diagnostic_handler = errors::Handler::with_tty_emitter(ColorConfig::Auto,
+                                                               None,
+                                                               true,
+                                                               false,
+                                                               codemap.clone());
 
     let cstore = Rc::new(CStore::new(token::get_ident_interner()));
     let sess = session::build_session_(sessopts, cpath, diagnostic_handler,
@@ -146,17 +144,18 @@ pub fn run_core(search_paths: SearchPaths, cfgs: Vec<String>, externs: Externs,
     let krate = driver::assign_node_ids(&sess, krate);
     // Lower ast -> hir.
     let lcx = LoweringContext::new(&sess, Some(&krate));
-    let mut hir_forest = hir_map::Forest::new(lower_crate(&lcx, &krate));
+    let mut hir_forest = hir_map::Forest::new(lower_crate(&lcx, &krate), DepGraph::new(false));
     let arenas = ty::CtxtArenas::new();
     let hir_map = driver::make_map(&sess, &mut hir_forest);
 
-    driver::phase_3_run_analysis_passes(&sess,
-                                        &cstore,
-                                        hir_map,
-                                        &arenas,
-                                        &name,
-                                        resolve::MakeGlobMap::No,
-                                        |tcx, _, analysis| {
+    abort_on_err(driver::phase_3_run_analysis_passes(&sess,
+                                                     &cstore,
+                                                     hir_map,
+                                                     &arenas,
+                                                     &name,
+                                                     resolve::MakeGlobMap::No,
+                                                     |tcx, _, analysis, _| {
+        let _ignore = tcx.dep_graph.in_ignore();
         let ty::CrateAnalysis { access_levels, .. } = analysis;
 
         // Convert from a NodeId set to a DefId set since we don't always have easy access
@@ -202,5 +201,5 @@ pub fn run_core(search_paths: SearchPaths, cfgs: Vec<String>, externs: Externs,
         *analysis.inlined.borrow_mut() = map;
         analysis.deref_trait_did = ctxt.deref_trait_did.get();
         (krate, analysis)
-    })
+    }), &sess)
 }
