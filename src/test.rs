@@ -25,6 +25,7 @@ use std::sync::{Arc, Mutex};
 
 use testing;
 use rustc_lint;
+use rustc::dep_graph::DepGraph;
 use rustc::front::map as hir_map;
 use rustc::session::{self, config};
 use rustc::session::config::{get_unstable_features_setting, OutputType};
@@ -73,11 +74,11 @@ pub fn run(input: &str,
     };
 
     let codemap = Rc::new(CodeMap::new());
-    let diagnostic_handler = errors::Handler::new(ColorConfig::Auto,
-                                                  None,
-                                                  true,
-                                                  false,
-                                                  codemap.clone());
+    let diagnostic_handler = errors::Handler::with_tty_emitter(ColorConfig::Auto,
+                                                               None,
+                                                               true,
+                                                               false,
+                                                               codemap.clone());
 
     let cstore = Rc::new(CStore::new(token::get_ident_interner()));
     let sess = session::build_session_(sessopts,
@@ -99,7 +100,9 @@ pub fn run(input: &str,
 
     let opts = scrape_test_config(&krate);
 
-    let mut forest = hir_map::Forest::new(krate);
+    let dep_graph = DepGraph::new(false);
+    let _ignore = dep_graph.in_ignore();
+    let mut forest = hir_map::Forest::new(krate, dep_graph.clone());
     let map = hir_map::map_crate(&mut forest);
 
     let ctx = core::DocContext {
@@ -250,7 +253,12 @@ fn runtest(test: &str, cratename: &str, cfgs: Vec<String>, libs: SearchPaths,
     if no_run {
         control.after_analysis.stop = Compilation::Stop;
     }
-    driver::compile_input(sess, &cstore, cfg, &input, &out, &None, None, control);
+    let result = driver::compile_input(&sess, &cstore, cfg, &input,
+                                       &out, &None, None, control);
+    match result {
+        Err(count) if count > 0 => sess.fatal("aborting due to previous error(s)"),
+        _ => {}
+    }
 
     if no_run { return }
 
@@ -319,6 +327,7 @@ pub fn maketest(s: &str, cratename: Option<&str>, dont_insert_main: bool,
     } else {
         prog.push_str("fn main() {\n    ");
         prog.push_str(&everything_else.replace("\n", "\n    "));
+        prog = prog.trim().into();
         prog.push_str("\n}");
     }
 
