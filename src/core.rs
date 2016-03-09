@@ -10,11 +10,12 @@
 pub use self::MaybeTyped::*;
 
 use rustc_lint;
-use rustc_driver::{driver, target_features};
+use rustc_driver::{driver, target_features, abort_on_err};
+use rustc::dep_graph::DepGraph;
 use rustc::session::{self, config};
 use rustc::middle::def_id::DefId;
 use rustc::middle::privacy::AccessLevels;
-use rustc::middle::ty;
+use rustc::middle::ty::{self, TyCtxt};
 use rustc::front::map as hir_map;
 use rustc::lint;
 use rustc_trans::back::link;
@@ -42,7 +43,7 @@ pub use rustc::session::search_paths::SearchPaths;
 
 /// Are we generating documentation (`Typed`) or tests (`NotTyped`)?
 pub enum MaybeTyped<'a, 'tcx: 'a> {
-    Typed(&'a ty::ctxt<'tcx>),
+    Typed(&'a TyCtxt<'tcx>),
     NotTyped(&'a session::Session)
 }
 
@@ -69,14 +70,14 @@ impl<'b, 'tcx> DocContext<'b, 'tcx> {
         }
     }
 
-    pub fn tcx_opt<'a>(&'a self) -> Option<&'a ty::ctxt<'tcx>> {
+    pub fn tcx_opt<'a>(&'a self) -> Option<&'a TyCtxt<'tcx>> {
         match self.maybe_typed {
             Typed(tcx) => Some(tcx),
             NotTyped(_) => None
         }
     }
 
-    pub fn tcx<'a>(&'a self) -> &'a ty::ctxt<'tcx> {
+    pub fn tcx<'a>(&'a self) -> &'a TyCtxt<'tcx> {
         let tcx_opt = self.tcx_opt();
         tcx_opt.expect("tcx not present")
     }
@@ -121,11 +122,11 @@ pub fn run_core(search_paths: SearchPaths, cfgs: Vec<String>, externs: Externs,
     };
 
     let codemap = Rc::new(codemap::CodeMap::new());
-    let diagnostic_handler = errors::Handler::new(ColorConfig::Auto,
-                                                  None,
-                                                  true,
-                                                  false,
-                                                  codemap.clone());
+    let diagnostic_handler = errors::Handler::with_tty_emitter(ColorConfig::Auto,
+                                                               None,
+                                                               true,
+                                                               false,
+                                                               codemap.clone());
 
     let cstore = Rc::new(CStore::new(token::get_ident_interner()));
     let sess = session::build_session_(sessopts, cpath, diagnostic_handler,
@@ -146,17 +147,23 @@ pub fn run_core(search_paths: SearchPaths, cfgs: Vec<String>, externs: Externs,
     let krate = driver::assign_node_ids(&sess, krate);
     // Lower ast -> hir.
     let lcx = LoweringContext::new(&sess, Some(&krate));
-    let mut hir_forest = hir_map::Forest::new(lower_crate(&lcx, &krate));
+    let mut hir_forest = hir_map::Forest::new(lower_crate(&lcx, &krate), DepGraph::new(false));
     let arenas = ty::CtxtArenas::new();
     let hir_map = driver::make_map(&sess, &mut hir_forest);
 
-    driver::phase_3_run_analysis_passes(&sess,
-                                        &cstore,
-                                        hir_map,
-                                        &arenas,
-                                        &name,
-                                        resolve::MakeGlobMap::No,
-                                        |tcx, _, analysis| {
+    let krate_and_analysis = abort_on_err(driver::phase_3_run_analysis_passes(&sess,
+                                                     &cstore,
+                                                     hir_map,
+                                                     &arenas,
+                                                     &name,
+                                                     resolve::MakeGlobMap::No,
+                                                     |tcx, _, analysis, result| {
+        // Return if the driver hit an err (in `result`)
+        if let Err(_) = result {
+            return None
+        }
+
+        let _ignore = tcx.dep_graph.in_ignore();
         let ty::CrateAnalysis { access_levels, .. } = analysis;
 
         // Convert from a NodeId set to a DefId set since we don't always have easy access
@@ -196,11 +203,17 @@ pub fn run_core(search_paths: SearchPaths, cfgs: Vec<String>, externs: Externs,
 
         let external_paths = ctxt.external_paths.borrow_mut().take();
         *analysis.external_paths.borrow_mut() = external_paths;
+
         let map = ctxt.external_typarams.borrow_mut().take();
         *analysis.external_typarams.borrow_mut() = map;
+
         let map = ctxt.inlined.borrow_mut().take();
         *analysis.inlined.borrow_mut() = map;
+
         analysis.deref_trait_did = ctxt.deref_trait_did.get();
-        (krate, analysis)
-    })
+
+        Some((krate, analysis))
+    }), &sess);
+
+    krate_and_analysis.unwrap()
 }

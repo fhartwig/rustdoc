@@ -18,6 +18,7 @@ use std::ffi::OsString;
 use std::io::prelude::*;
 use std::io;
 use std::path::PathBuf;
+use std::panic::{self, AssertRecoverSafe};
 use std::process::Command;
 use std::rc::Rc;
 use std::str;
@@ -25,6 +26,7 @@ use std::sync::{Arc, Mutex};
 
 use testing;
 use rustc_lint;
+use rustc::dep_graph::DepGraph;
 use rustc::front::map as hir_map;
 use rustc::session::{self, config};
 use rustc::session::config::{get_unstable_features_setting, OutputType};
@@ -73,11 +75,11 @@ pub fn run(input: &str,
     };
 
     let codemap = Rc::new(CodeMap::new());
-    let diagnostic_handler = errors::Handler::new(ColorConfig::Auto,
-                                                  None,
-                                                  true,
-                                                  false,
-                                                  codemap.clone());
+    let diagnostic_handler = errors::Handler::with_tty_emitter(ColorConfig::Auto,
+                                                               None,
+                                                               true,
+                                                               false,
+                                                               codemap.clone());
 
     let cstore = Rc::new(CStore::new(token::get_ident_interner()));
     let sess = session::build_session_(sessopts,
@@ -99,7 +101,9 @@ pub fn run(input: &str,
 
     let opts = scrape_test_config(&krate);
 
-    let mut forest = hir_map::Forest::new(krate);
+    let dep_graph = DepGraph::new(false);
+    let _ignore = dep_graph.in_ignore();
+    let mut forest = hir_map::Forest::new(krate, dep_graph.clone());
     let map = hir_map::map_crate(&mut forest);
 
     let ctx = core::DocContext {
@@ -117,9 +121,8 @@ pub fn run(input: &str,
     let mut v = RustdocVisitor::new(&ctx, None);
     v.visit(ctx.map.krate());
     let mut krate = v.clean(&ctx);
-    match crate_name {
-        Some(name) => krate.name = name,
-        None => {}
+    if let Some(name) = crate_name {
+        krate.name = name;
     }
     let (krate, _) = passes::collapse_docs(krate);
     let (krate, _) = passes::unindent_comments(krate);
@@ -175,7 +178,7 @@ fn scrape_test_config(krate: &::rustc_front::hir::Crate) -> TestOptions {
 fn runtest(test: &str, cratename: &str, cfgs: Vec<String>, libs: SearchPaths,
            externs: core::Externs,
            should_panic: bool, no_run: bool, as_test_harness: bool,
-           opts: &TestOptions) {
+           compile_fail: bool, opts: &TestOptions) {
     // the test harness wants its own `main` & top level functions, so
     // never wrap the test in `fn main() { ... }`
     let test = maketest(test, Some(cratename), as_test_harness, opts);
@@ -241,16 +244,41 @@ fn runtest(test: &str, cratename: &str, cfgs: Vec<String>, libs: SearchPaths,
                                        cstore.clone());
     rustc_lint::register_builtins(&mut sess.lint_store.borrow_mut(), Some(&sess));
 
-    let outdir = TempDir::new("rustdoctest").ok().expect("rustdoc needs a tempdir");
-    let out = Some(outdir.path().to_path_buf());
-    let mut cfg = config::build_configuration(&sess);
-    cfg.extend(config::parse_cfgspecs(cfgs));
+    let outdir = Mutex::new(TempDir::new("rustdoctest").ok().expect("rustdoc needs a tempdir"));
     let libdir = sess.target_filesearch(PathKind::All).get_lib_path();
     let mut control = driver::CompileController::basic();
+    let mut cfg = config::build_configuration(&sess);
+    cfg.extend(config::parse_cfgspecs(cfgs.clone()));
+    let out = Some(outdir.lock().unwrap().path().to_path_buf());
+
     if no_run {
         control.after_analysis.stop = Compilation::Stop;
     }
-    driver::compile_input(sess, &cstore, cfg, &input, &out, &None, None, control);
+
+    match {
+        let b_sess = AssertRecoverSafe::new(&sess);
+        let b_cstore = AssertRecoverSafe::new(&cstore);
+        let b_cfg = AssertRecoverSafe::new(cfg.clone());
+        let b_control = AssertRecoverSafe::new(&control);
+
+        panic::recover(|| {
+            driver::compile_input(&b_sess, &b_cstore, (*b_cfg).clone(),
+                                  &input, &out,
+                                  &None, None, &b_control)
+        })
+    } {
+        Ok(r) => {
+            match r {
+                Err(count) if count > 0 && compile_fail == false => {
+                    sess.fatal("aborting due to previous error(s)")
+                }
+                Ok(()) if compile_fail => panic!("test compiled while it wasn't supposed to"),
+                _ => {}
+            }
+        }
+        Err(_) if compile_fail == false => panic!("couldn't compile the test"),
+        _ => {}
+    }
 
     if no_run { return }
 
@@ -260,7 +288,7 @@ fn runtest(test: &str, cratename: &str, cfgs: Vec<String>, libs: SearchPaths,
     // environment to ensure that the target loads the right libraries at
     // runtime. It would be a sad day if the *host* libraries were loaded as a
     // mistake.
-    let mut cmd = Command::new(&outdir.path().join("rust_out"));
+    let mut cmd = Command::new(&outdir.lock().unwrap().path().join("rust_out"));
     let var = DynamicLibrary::envvar();
     let newpath = {
         let path = env::var_os(var).unwrap_or(OsString::new());
@@ -305,13 +333,10 @@ pub fn maketest(s: &str, cratename: Option<&str>, dont_insert_main: bool,
     // Don't inject `extern crate std` because it's already injected by the
     // compiler.
     if !s.contains("extern crate") && !opts.no_crate_inject && cratename != Some("std") {
-        match cratename {
-            Some(cratename) => {
-                if s.contains(cratename) {
-                    prog.push_str(&format!("extern crate {};\n", cratename));
-                }
+        if let Some(cratename) = cratename {
+            if s.contains(cratename) {
+                prog.push_str(&format!("extern crate {};\n", cratename));
             }
-            None => {}
         }
     }
     if dont_insert_main || s.contains("fn main") {
@@ -319,6 +344,7 @@ pub fn maketest(s: &str, cratename: Option<&str>, dont_insert_main: bool,
     } else {
         prog.push_str("fn main() {\n    ");
         prog.push_str(&everything_else.replace("\n", "\n    "));
+        prog = prog.trim().into();
         prog.push_str("\n}");
     }
 
@@ -383,7 +409,7 @@ impl Collector {
 
     pub fn add_test(&mut self, test: String,
                     should_panic: bool, no_run: bool, should_ignore: bool,
-                    as_test_harness: bool) {
+                    as_test_harness: bool, compile_fail: bool) {
         let name = if self.use_headers {
             let s = self.current_header.as_ref().map(|s| &**s).unwrap_or("");
             format!("{}_{}", s, self.cnt)
@@ -413,6 +439,7 @@ impl Collector {
                         should_panic,
                         no_run,
                         as_test_harness,
+                        compile_fail,
                         &opts);
             }))
         });
@@ -445,12 +472,7 @@ impl DocFolder for Collector {
             _ => typename_if_impl(&item)
         };
 
-        let pushed = if let Some(name) = current_name {
-            self.names.push(name);
-            true
-        } else {
-            false
-        };
+        let pushed = current_name.map(|name| self.names.push(name)).is_some();
 
         if let Some(doc) = item.doc_value() {
             self.cnt = 0;
